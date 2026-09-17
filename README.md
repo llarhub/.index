@@ -1,2 +1,2 @@
-# .index
-LLAR Hub Index
+# llarhub
+LLAR Formula Repository

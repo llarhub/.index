@@ -1,0 +1,103 @@
+import (
+	"os"
+	"path/filepath"
+)
+
+const consumerSource = `#include <poly2tri/poly2tri.h>
+
+int main() {
+    p2t::Point p1(0.0, 0.0);
+    p2t::Point p2(1.0, 0.0);
+    p2t::Point p3(0.0, 1.0);
+    p2t::Triangle triangle(p1, p2, p3);
+    return 0;
+}
+`
+
+// Conan Center cci.20130502 pins greenm01/poly2tri to this untagged commit.
+id "greenm01/poly2tri"
+
+fromVer "88de49021b6d9bef6faa1bc94ceb3fbd85c3c204"
+
+defaults {
+	"shared": "OFF",
+	"fPIC": "ON",
+}
+
+filter => {
+	for name, values in target.options {
+		if name != "shared" && name != "fPIC" {
+			return false
+		}
+		for value in values {
+			if value != "ON" && value != "OFF" {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+onBuild ctx => {
+	installDir := ctx.outputDir
+
+	cmakeLists := ctx.Proj.readFile("88de49021b6d9bef6faa1bc94ceb3fbd85c3c204/CMakeLists.txt")!
+	os.writeFile(filepath.join(ctx.SourceDir, "CMakeLists.txt"), cmakeLists, 0o644)!
+
+	shared := target.options["shared"][0] == "ON"
+	fPIC := target.options["fPIC"][0] == "ON"
+	c := cmake.new(ctx.SourceDir, filepath.join(ctx.SourceDir, "_build"), installDir)
+	c.define "POLY2TRI_SRC_DIR", filepath.join(ctx.SourceDir, "poly2tri")
+	c.define "CMAKE_INSTALL_LIBDIR", "lib"
+	c.defineBool "BUILD_SHARED_LIBS", shared
+	c.defineBool "CMAKE_POSITION_INDEPENDENT_CODE", fPIC
+	c.configure
+	c.build
+	c.install
+
+	licenseDir := filepath.join(installDir, "licenses")
+	os.mkdirAll(licenseDir, 0o755)!
+	os.writeFile(filepath.join(licenseDir, "LICENSE"), os.readFile(filepath.join(ctx.SourceDir, "LICENSE"))!, 0o644)!
+
+	libs := ["-L$${libdir}", "-lpoly2tri"]
+	if target.require["os"][0] == "linux" || target.require["os"][0] == "freebsd" {
+		libs <- "-lm"
+	}
+	pcDir := filepath.join(installDir, "lib", "pkgconfig")
+	os.mkdirAll(pcDir, 0o755)!
+	pc := pkgconfig.new(
+		name = "poly2tri",
+		description = "2D constrained Delaunay triangulation library",
+		version = "88de49021b6d9bef6faa1bc94ceb3fbd85c3c204",
+		libs = libs,
+		cflags = ["-I$${includedir}"],
+	)!
+	out := os.create(filepath.join(pcDir, "poly2tri.pc"))!
+	pc.writeTo(out)!
+	out.close()!
+
+	pkgconfig.use installDir
+	ctx.setMetadata pkgconfig.lookup("poly2tri")!
+}
+
+onTest ctx => {
+	installDir := ctx.outputDir
+	testDir := filepath.join(ctx.SourceDir, "_llar_consumer")
+	testBuild := filepath.join(testDir, "_build")
+	sourcePath := filepath.join(testDir, "consumer.cpp")
+	binary := filepath.join(testBuild, "consumer")
+	os.mkdirAll(testDir, 0o755)!
+	os.mkdirAll(testBuild, 0o755)!
+	os.writeFile(sourcePath, []byte(consumerSource), 0o644)!
+
+	pkgconfig.use installDir
+	flagsFile := filepath.join(testDir, "poly2tri.flags")
+	os.writeFile(flagsFile, []byte(pkgconfig.lookup("poly2tri")!), 0o644)!
+	exec! "c++", "-std=c++11", sourcePath, "-o", binary, "@"+flagsFile
+
+	if target.options["shared"][0] == "ON" {
+		os.setenv("LD_LIBRARY_PATH", filepath.join(installDir, "lib"))!
+		os.setenv("DYLD_LIBRARY_PATH", filepath.join(installDir, "lib"))!
+	}
+	exec! binary
+}

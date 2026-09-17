@@ -1,0 +1,3 @@
+# Fenno repository config.
+# https://fenno.ai/en/docs/configuration/
+default_ai_provider: codex

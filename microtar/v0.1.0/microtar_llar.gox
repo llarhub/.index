@@ -1,0 +1,119 @@
+import (
+	"os"
+	"path/filepath"
+)
+
+const consumerSource = `#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <microtar.h>
+
+int main(void) {
+    mtar_t tar;
+    const char *str1 = "Hello world";
+    const char *str2 = "Goodbye world";
+
+    if (mtar_open(&tar, "test.tar", "w") != MTAR_ESUCCESS) {
+        return EXIT_FAILURE;
+    }
+    if (mtar_write_file_header(&tar, "test1.txt", strlen(str1)) != MTAR_ESUCCESS ||
+        mtar_write_data(&tar, str1, strlen(str1)) != MTAR_ESUCCESS ||
+        mtar_write_file_header(&tar, "test2.txt", strlen(str2)) != MTAR_ESUCCESS ||
+        mtar_write_data(&tar, str2, strlen(str2)) != MTAR_ESUCCESS ||
+        mtar_finalize(&tar) != MTAR_ESUCCESS ||
+        mtar_close(&tar) != MTAR_ESUCCESS) {
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+`
+
+id "rxi/microtar"
+
+fromVer "v0.1.0"
+
+defaults {
+	"shared": "OFF",
+	"fPIC": "ON",
+}
+
+filter => {
+	for name, values in target.options {
+		if name != "shared" && name != "fPIC" {
+			return false
+		}
+		for value in values {
+			if value != "ON" && value != "OFF" {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+onBuild ctx => {
+	installDir := ctx.outputDir
+
+	cmakeLists := ctx.Proj.readFile("v0.1.0/CMakeLists.txt")!
+	os.writeFile(filepath.join(ctx.SourceDir, "CMakeLists.txt"), cmakeLists, 0o644)!
+
+	shared := target.options["shared"][0] == "ON"
+	fPIC := target.options["fPIC"][0] == "ON"
+	c := cmake.new(ctx.SourceDir, filepath.join(ctx.SourceDir, "_build"), installDir)
+	c.define "MICROTAR_SRC_DIR", ctx.SourceDir
+	c.define "CMAKE_INSTALL_LIBDIR", "lib"
+	c.defineBool "BUILD_SHARED_LIBS", shared
+	c.defineBool "CMAKE_POSITION_INDEPENDENT_CODE", fPIC
+	c.configure
+	c.build
+	c.install
+
+	licenseDir := filepath.join(installDir, "licenses")
+	os.mkdirAll(licenseDir, 0o755)!
+	os.writeFile(filepath.join(licenseDir, "LICENSE"), os.readFile(filepath.join(ctx.SourceDir, "LICENSE"))!, 0o644)!
+
+	pcDir := filepath.join(installDir, "lib", "pkgconfig")
+	os.mkdirAll(pcDir, 0o755)!
+
+	pc := pkgconfig.new(
+		name = "microtar",
+		description = "A lightweight tar library written in ANSI C",
+		version = "v0.1.0",
+		libs = ["-L$${libdir}", "-lmicrotar"],
+		cflags = ["-I$${includedir}"],
+	)!
+
+	out := os.create(filepath.join(pcDir, "microtar.pc"))!
+	pc.writeTo(out)!
+	out.close()!
+
+	pkgconfig.use installDir
+	ctx.setMetadata pkgconfig.lookup("microtar")!
+}
+
+onTest ctx => {
+	installDir := ctx.outputDir
+	testDir := filepath.join(ctx.SourceDir, "_llar_consumer")
+	os.mkdirAll(testDir, 0o755)!
+
+	sourcePath := filepath.join(testDir, "consumer.c")
+	os.writeFile(sourcePath, []byte(consumerSource), 0o644)!
+
+	binary := filepath.join(testDir, "consumer")
+
+	pkgconfig.use installDir
+	flagsFile := filepath.join(testDir, "microtar.flags")
+	os.writeFile(flagsFile, []byte(pkgconfig.lookup("microtar")!), 0o644)!
+	cc! sourcePath, "@"+flagsFile, "-o", binary
+
+	if target.options["shared"][0] == "ON" {
+		os.setenv("LD_LIBRARY_PATH", filepath.join(installDir, "lib"))!
+		os.setenv("DYLD_LIBRARY_PATH", filepath.join(installDir, "lib"))!
+		if target.require["os"][0] == "windows" {
+			path := os.getenv("PATH")
+			os.setenv("PATH", filepath.join(installDir, "bin")+";"+path)!
+		}
+	}
+
+	exec! binary
+}

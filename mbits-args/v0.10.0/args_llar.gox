@@ -1,0 +1,105 @@
+import (
+	"os"
+	"path/filepath"
+)
+
+const consumerSource = `#include <args/parser.hpp>
+#include <algorithm>
+#include <cstdio>
+#include <numeric>
+#include <vector>
+
+template <typename Pred>
+unsigned accumulate(std::vector<unsigned> const& integers, Pred pred) {
+    return std::accumulate(integers.begin(), integers.end(), 0u, pred);
+}
+
+int main(int argc, char* argv[]) {
+    std::vector<unsigned> integers{};
+    bool is_sum{false};
+
+    args::null_translator tr{};
+    args::parser parser{"Process some integers.",
+        args::from_main(argc, argv), &tr};
+    parser.set<std::true_type>(is_sum, "sum")
+        .opt()
+        .help("sum the integers (default: find the max)");
+    parser.arg(integers)
+        .meta("N")
+        .help("an integer for the accumulator");
+
+    parser.parse();
+
+    auto const result =
+        is_sum ? accumulate(integers, [](auto a, auto b) { return a + b; })
+               : accumulate(integers,
+                            [](auto a, auto b) { return std::max(a, b); });
+    printf("%u\n", result);
+}
+`
+
+var sourcePatch = `diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3d9271c..28c176f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -12,3 +11,0 @@ if (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+-  include($${CMAKE_BINARY_DIR}/conanbuildinfo.cmake)
+-  conan_basic_setup(TARGETS)
+-
+`
+
+id "mbits-libs/args"
+
+fromVer "v0.10.0"
+
+onBuild ctx => {
+	installDir := ctx.outputDir
+	_, err := os.stat(filepath.join(ctx.SourceDir, "conanfile.txt"))
+	if err == nil {
+		patchFile := filepath.join(ctx.SourceDir, "_llar.patch")
+		os.writeFile(patchFile, []byte(sourcePatch), 0o644)!
+		git! "apply", "--unidiff-zero", patchFile
+	} else if !os.isNotExist(err) {
+		panic err
+	}
+
+	c := cmake.new(ctx.SourceDir, filepath.join(ctx.SourceDir, "_build"), installDir)
+	c.defineBool "LIBARGS_TESTING", false
+	c.defineBool "LIBARGS_INSTALL", true
+	c.configure
+	c.build
+	c.install
+
+	pcDir := filepath.join(installDir, "lib", "pkgconfig")
+	os.mkdirAll(pcDir, 0o755)!
+	pc := pkgconfig.new(
+		name = "args",
+		description = "mbits args parser",
+		version = "v0.10.0",
+		libs = ["-L$${libdir}", "-largs"],
+		cflags = ["-I$${includedir}"],
+	)!
+	out := os.create(filepath.join(pcDir, "args.pc"))!
+	pc.writeTo(out)!
+	out.close()!
+
+	pkgconfig.use installDir
+	ctx.setMetadata pkgconfig.lookup("args")!
+}
+
+onTest ctx => {
+	installDir := ctx.outputDir
+	testDir := filepath.join(ctx.SourceDir, "_llar_consumer")
+	os.mkdirAll(testDir, 0o755)!
+
+	consumer := filepath.join(testDir, "consumer.cpp")
+	os.writeFile(consumer, []byte(consumerSource), 0o644)!
+
+	pkgconfig.use installDir
+	flagsFile := filepath.join(testDir, "args.flags")
+	os.writeFile(flagsFile, []byte(pkgconfig.lookup("args")!), 0o644)!
+
+	binary := filepath.join(testDir, "consumer")
+	exec! "c++", "-std=c++17", consumer, "-o", binary, "@"+flagsFile
+	exec! binary, "--sum", "1", "2", "3"
+}

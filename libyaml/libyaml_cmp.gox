@@ -1,0 +1,13 @@
+import "strings"
+
+func normalize(version string) string {
+	version = strings.trimPrefix(version, "dist-")
+	if strings.hasPrefix(version, "v") {
+		return version
+	}
+	return "v" + version
+}
+
+compareVer (a, b) => {
+	return semver.Compare(normalize(a.Version), normalize(b.Version))
+}

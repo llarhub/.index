@@ -1,0 +1,87 @@
+import (
+	"os"
+	"path/filepath"
+	"slices"
+)
+
+id "GNOME/libxml2"
+
+fromVer "v2.9.13"
+
+filter => {
+	return slices.contains(target.require["os"], "linux") || slices.contains(target.require["os"], "darwin")
+}
+
+onRequire (proj, deps) => {
+	deps.require "madler/zlib", "v1.3.1"
+	deps.require "xgo-dev/libiconv", "v1.19"
+}
+
+onBuild ctx => {
+	installDir := ctx.outputDir
+	c := cmake.new(ctx.SourceDir, filepath.join(ctx.SourceDir, "_build"), installDir)
+	c.buildType "Release"
+	c.define "CMAKE_INSTALL_LIBDIR", "lib"
+	c.defineBool "BUILD_SHARED_LIBS", false
+	c.defineBool "LIBXML2_WITH_ICONV", true
+	c.defineBool "Iconv_IS_BUILT_IN", false
+	c.defineBool "LIBXML2_WITH_ZLIB", true
+	c.defineBool "LIBXML2_WITH_ICU", false
+	c.defineBool "LIBXML2_WITH_PYTHON", false
+	c.defineBool "LIBXML2_WITH_TESTS", false
+	// Older releases default to LZMA support; newer CMake files removed it.
+	cmakeSource := string(os.readFile(filepath.join(ctx.SourceDir, "CMakeLists.txt"))!)
+	if cmakeSource.contains("LIBXML2_WITH_LZMA") {
+		c.defineBool "LIBXML2_WITH_LZMA", false
+	}
+	for dep in ctx.Proj.Deps {
+		c.use ctx.outputDir(dep)
+	}
+	c.configure
+	c.build "--parallel", "4"
+	c.install
+
+	licenseDir := filepath.join(installDir, "licenses")
+	os.mkdirAll(licenseDir, 0o755)!
+	os.writeFile(filepath.join(licenseDir, "Copyright"), os.readFile(filepath.join(ctx.SourceDir, "Copyright"))!, 0o644)!
+
+	// Publish the static dependency closure: upstream .pc files can leave it
+	// in Libs.private or omit the external libiconv search directory.
+	libs := ["-L$${libdir}", "-lxml2", "-lm", "-ldl"]
+	if slices.contains(target.require["os"], "linux") {
+		libs <- "-lpthread"
+	}
+	pc := pkgconfig.new(
+		name = "libXML",
+		description = "libXML library version2.",
+		version = "2.9.13",
+		requires = ["libiconv", "zlib"],
+		libs = libs,
+		cflags = ["-I$${includedir}/libxml2"],
+	)!
+	pcFile := os.create(filepath.join(installDir, "lib", "pkgconfig", "libxml-2.0.pc"))!
+	pc.writeTo(pcFile)!
+	pcFile.close()!
+	for dep in ctx.Proj.Deps {
+		pkgconfig.use ctx.outputDir(dep)
+	}
+	pkgconfig.use installDir
+	ctx.setMetadata pkgconfig.lookup("libxml-2.0")!
+}
+
+onTest ctx => {
+	installDir := ctx.outputDir
+	testDir := filepath.join(ctx.SourceDir, "_llar_consumer")
+	os.mkdirAll(testDir, 0o755)!
+	consumer := filepath.join(testDir, "consumer.c")
+	os.writeFile(consumer, ctx.Proj.readFile("v2.9.13/consumer.c")!, 0o644)!
+	for dep in ctx.Proj.Deps {
+		pkgconfig.use ctx.outputDir(dep)
+	}
+	pkgconfig.use installDir
+	flagsFile := filepath.join(testDir, "libxml2.flags")
+	os.writeFile(flagsFile, []byte(pkgconfig.lookup("libxml-2.0")!), 0o644)!
+	binary := filepath.join(testDir, "consumer")
+	cc! consumer, "@"+flagsFile, "-o", binary
+	exec! binary
+}
