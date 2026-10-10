@@ -1,0 +1,98 @@
+import (
+	"os"
+	"path/filepath"
+	"slices"
+)
+
+id "Z3Prover/z3"
+
+fromVer "z3-4.13.2"
+
+onBuild ctx => {
+	installDir := ctx.outputDir
+
+	c := cmake.new(ctx.SourceDir, filepath.join(ctx.SourceDir, "_build"), installDir)
+	c.buildType "Release"
+	c.define "CMAKE_INSTALL_LIBDIR", "lib"
+	c.defineBool "CMAKE_POSITION_INDEPENDENT_CODE", true
+	c.defineBool "Z3_USE_LIB_GMP", false
+	c.defineBool "Z3_SINGLE_THREADED", false
+	c.defineBool "Z3_BUILD_LIBZ3_SHARED", false
+	c.defineBool "Z3_INCLUDE_GIT_HASH", false
+	c.defineBool "Z3_INCLUDE_GIT_DESCRIBE", false
+	c.defineBool "Z3_ENABLE_EXAMPLE_TARGETS", false
+	c.defineBool "Z3_BUILD_DOCUMENTATION", false
+	c.configure
+	c.build "--parallel", "4"
+	c.install
+
+	licenseDir := filepath.join(installDir, "licenses")
+	os.mkdirAll(licenseDir, 0o755)!
+	os.writeFile(filepath.join(licenseDir, "LICENSE.txt"), os.readFile(filepath.join(ctx.SourceDir, "LICENSE.txt"))!, 0o644)!
+
+	// Upstream writes CMAKE_INSTALL_PREFIX into z3.pc and omits pthread for
+	// this static library. Author a relocatable file with fromVer Version.
+	pcDir := filepath.join(installDir, "lib", "pkgconfig")
+	os.mkdirAll(pcDir, 0o755)!
+	pcPath := filepath.join(pcDir, "z3.pc")
+
+	description := "The Z3 Theorem Prover"
+	cflags := ["-I$${includedir}"]
+	if _, err := os.stat(pcPath); err == nil {
+		for line in string(os.readFile(pcPath)!).split("\n") {
+			if line.hasPrefix("Description:") {
+				value := line.trimPrefix("Description:").trimSpace()
+				if value != "" {
+					description = value
+				}
+			}
+			if line.hasPrefix("Cflags:") {
+				for flag in line.trimPrefix("Cflags:").fields {
+					if flag == "" || flag == "-I$${includedir}" || flag.hasPrefix("-I") {
+						continue
+					}
+					cflags <- flag
+				}
+			}
+		}
+	} else if !os.isNotExist(err) {
+		panic err
+	}
+
+	libs := ["-L$${libdir}", "-lz3"]
+	if slices.contains(target.require["os"], "linux") || slices.contains(target.require["os"], "freebsd") {
+		libs <- "-lpthread"
+		libs <- "-lm"
+	}
+
+	pc := pkgconfig.new(
+		name = "z3",
+		description = description,
+		version = "z3-4.13.2",
+		libs = libs,
+		cflags = cflags,
+	)!
+	out := os.create(pcPath)!
+	pc.writeTo(out)!
+	out.close()!
+
+	pkgconfig.use installDir
+	ctx.setMetadata pkgconfig.lookup("z3")!
+}
+
+onTest ctx => {
+	installDir := ctx.outputDir
+	testDir := filepath.join(ctx.SourceDir, "_llar_consumer")
+	os.mkdirAll(testDir, 0o755)!
+
+	consumer := filepath.join(testDir, "consumer.cpp")
+	os.writeFile(consumer, ctx.Proj.readFile("z3-4.13.2/consumer.cpp")!, 0o644)!
+
+	pkgconfig.use installDir
+	flagsFile := filepath.join(testDir, "z3.flags")
+	os.writeFile(flagsFile, []byte(pkgconfig.lookup("z3")!), 0o644)!
+
+	binary := filepath.join(testDir, "consumer")
+	exec! "c++", "-std=c++17", consumer, "-o", binary, "@"+flagsFile
+	exec! binary
+}
