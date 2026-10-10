@@ -1,0 +1,165 @@
+import (
+	"os"
+	"path/filepath"
+	"slices"
+)
+
+const consumerC = `#include <reproc/reproc.h>
+
+int main(void) {
+    reproc_t *process = reproc_new();
+    if (!process) {
+        return 1;
+    }
+    reproc_destroy(process);
+    return 0;
+}
+`
+
+const consumerCXX = `#include <reproc++/run.hpp>
+#include <iostream>
+#include <utility>
+
+int main() {
+    reproc::options options;
+    options.redirect.parent = true;
+    const char *argv[] = {"true", nullptr};
+    std::pair<int, std::error_code> result = reproc::run(argv, options);
+    if (result.second) {
+        std::cerr << result.second.message() << std::endl;
+        return 1;
+    }
+    return result.first;
+}
+`
+
+id "DaanDeMeyer/reproc"
+
+fromVer "v14.2.5"
+
+defaults {
+	"shared": "OFF",
+	"fPIC": "ON",
+	"cxx": "ON",
+	"multithreaded": "ON",
+}
+
+filter => {
+	for name, values in target.options {
+		if name != "shared" && name != "fPIC" && name != "cxx" && name != "multithreaded" {
+			return false
+		}
+		for value in values {
+			if value != "ON" && value != "OFF" {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+onBuild ctx => {
+	installDir := ctx.outputDir
+	shared := target.options["shared"][0] == "ON"
+	fPIC := target.options["fPIC"][0] == "ON"
+	cxx := target.options["cxx"][0] == "ON"
+	multithreaded := target.options["multithreaded"][0] == "ON"
+	linux := slices.contains(target.require["os"], "linux")
+	windows := slices.contains(target.require["os"], "windows")
+
+	c := cmake.new(ctx.SourceDir, filepath.join(ctx.SourceDir, "_build"), installDir)
+	c.define "CMAKE_INSTALL_LIBDIR", "lib"
+	c.define "CMAKE_POLICY_VERSION_MINIMUM", "3.5"
+	c.defineBool "BUILD_SHARED_LIBS", shared
+	c.defineBool "CMAKE_POSITION_INDEPENDENT_CODE", fPIC
+	c.defineBool "REPROC++", cxx
+	c.defineBool "REPROC_MULTITHREADED", multithreaded
+	c.defineBool "REPROC_TEST", false
+	c.defineBool "REPROC_EXAMPLES", false
+	c.configure
+	c.build
+	c.install
+
+	licenseDir := filepath.join(installDir, "licenses")
+	os.mkdirAll(licenseDir, 0o755)!
+	os.writeFile(filepath.join(licenseDir, "LICENSE"), os.readFile(filepath.join(ctx.SourceDir, "LICENSE"))!, 0o644)!
+
+	reprocLibs := ["-L$${libdir}", "-lreproc"]
+	if linux {
+		reprocLibs <- "-lrt"
+		if multithreaded {
+			reprocLibs <- "-lpthread"
+		}
+	}
+	if windows {
+		reprocLibs <- "-lws2_32"
+	}
+
+	pcDir := filepath.join(installDir, "lib", "pkgconfig")
+	os.mkdirAll(pcDir, 0o755)!
+	reprocPC := pkgconfig.new(
+		name = "reproc",
+		description = "reproc C library",
+		version = "v14.2.5",
+		libs = reprocLibs,
+		cflags = ["-I$${includedir}"],
+	)!
+	reprocOut := os.create(filepath.join(pcDir, "reproc.pc"))!
+	reprocPC.writeTo(reprocOut)!
+	reprocOut.close()!
+
+	if cxx {
+		cxxPC := pkgconfig.new(
+			name = "reproc++",
+			description = "reproc C++ library",
+			version = "v14.2.5",
+			requires = ["reproc"],
+			libs = ["-L$${libdir}", "-lreproc++"],
+			cflags = ["-I$${includedir}"],
+		)!
+		cxxOut := os.create(filepath.join(pcDir, "reproc++.pc"))!
+		cxxPC.writeTo(cxxOut)!
+		cxxOut.close()!
+	}
+
+	pkgconfig.use installDir
+	lookupName := "reproc"
+	if cxx {
+		lookupName = "reproc++"
+	}
+	ctx.setMetadata pkgconfig.lookup(lookupName)!
+}
+
+onTest ctx => {
+	installDir := ctx.outputDir
+	testDir := filepath.join(ctx.SourceDir, "_llar_consumer")
+	os.mkdirAll(testDir, 0o755)!
+
+	cxx := target.options["cxx"][0] == "ON"
+	lookupName := "reproc"
+	consumer := filepath.join(testDir, "consumer.c")
+	source := consumerC
+	if cxx {
+		lookupName = "reproc++"
+		consumer = filepath.join(testDir, "consumer.cpp")
+		source = consumerCXX
+	}
+	os.writeFile(consumer, []byte(source), 0o644)!
+
+	pkgconfig.use installDir
+	flagsFile := filepath.join(testDir, lookupName+".flags")
+	os.writeFile(flagsFile, []byte(pkgconfig.lookup(lookupName)!), 0o644)!
+
+	binary := filepath.join(testDir, "consumer")
+	if cxx {
+		exec! "c++", "-std=c++11", consumer, "-o", binary, "@"+flagsFile
+	} else {
+		cc! consumer, "-o", binary, "@"+flagsFile
+	}
+
+	if target.options["shared"][0] == "ON" {
+		os.setenv("LD_LIBRARY_PATH", filepath.join(installDir, "lib"))!
+		os.setenv("DYLD_LIBRARY_PATH", filepath.join(installDir, "lib"))!
+	}
+	exec! binary
+}
