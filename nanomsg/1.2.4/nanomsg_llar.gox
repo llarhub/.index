@@ -1,0 +1,116 @@
+import (
+	"os"
+	"path/filepath"
+)
+
+const consumerSource = `#include <nanomsg/nn.h>
+
+int main(void) {
+    void *msg = nn_allocmsg(32, 0);
+    nn_freemsg(msg);
+    return 0;
+}
+`
+
+id "nanomsg/nanomsg"
+
+fromVer "1.2.4"
+
+defaults {
+	"shared": "OFF",
+	"fPIC": "ON",
+	"enable_coverage": "OFF",
+	"enable_getaddrinfo_a": "ON",
+	"enable_tools": "OFF",
+}
+
+filter => {
+	for name, values in target.options {
+		if name != "shared" && name != "fPIC" && name != "enable_coverage" && name != "enable_getaddrinfo_a" && name != "enable_tools" {
+			return false
+		}
+		for value in values {
+			if value != "ON" && value != "OFF" {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+onBuild ctx => {
+	installDir := ctx.outputDir
+	shared := target.options["shared"][0] == "ON"
+	fPIC := target.options["fPIC"][0] == "ON"
+	enableCoverage := target.options["enable_coverage"][0] == "ON"
+	enableGetaddrinfoA := target.options["enable_getaddrinfo_a"][0] == "ON"
+	enableTools := target.options["enable_tools"][0] == "ON"
+
+	c := cmake.new(ctx.SourceDir, filepath.join(ctx.SourceDir, "_build"), installDir)
+	c.define "CMAKE_INSTALL_LIBDIR", "lib"
+	c.define "CMAKE_POLICY_VERSION_MINIMUM", "3.5"
+	c.defineBool "BUILD_SHARED_LIBS", shared
+	c.defineBool "CMAKE_POSITION_INDEPENDENT_CODE", fPIC
+	c.defineBool "NN_STATIC_LIB", !shared
+	c.defineBool "NN_ENABLE_COVERAGE", enableCoverage
+	c.defineBool "NN_ENABLE_GETADDRINFO_A", enableGetaddrinfoA
+	c.defineBool "NN_ENABLE_DOC", false
+	c.defineBool "NN_TESTS", false
+	c.defineBool "NN_TOOLS", enableTools
+	c.configure
+	c.build
+	c.install
+
+	licenseDir := filepath.join(installDir, "licenses")
+	os.mkdirAll(licenseDir, 0o755)!
+	os.writeFile(filepath.join(licenseDir, "COPYING"), os.readFile(filepath.join(ctx.SourceDir, "COPYING"))!, 0o644)!
+
+	libs := ["-L$${libdir}", "-lnanomsg"]
+	cflags := ["-I$${includedir}"]
+	if !shared {
+		osName := target.require["os"][0]
+		if osName == "linux" || osName == "freebsd" {
+			// glibc on Ubuntu 24.04 no longer ships libnsl.so.1 by default.
+			libs <- ["-lpthread", "-lanl", "-lrt"]...
+		}
+		cflags <- "-DNN_STATIC_LIB"
+	}
+
+	pcDir := filepath.join(installDir, "lib", "pkgconfig")
+	os.mkdirAll(pcDir, 0o755)!
+	pc := pkgconfig.new(
+		name = "nanomsg",
+		description = "nanomsg",
+		version = "1.2.4",
+		libs = libs,
+		cflags = cflags,
+	)!
+	out := os.create(filepath.join(pcDir, "nanomsg.pc"))!
+	pc.writeTo(out)!
+	out.close()!
+
+	pkgconfig.use installDir
+	ctx.setMetadata pkgconfig.lookup("nanomsg")!
+}
+
+onTest ctx => {
+	installDir := ctx.outputDir
+	testDir := filepath.join(ctx.SourceDir, "_llar_consumer")
+	os.mkdirAll(testDir, 0o755)!
+
+	consumer := filepath.join(testDir, "consumer.c")
+	os.writeFile(consumer, []byte(consumerSource), 0o644)!
+
+	pkgconfig.use installDir
+	flagsFile := filepath.join(testDir, "nanomsg.flags")
+	os.writeFile(flagsFile, []byte(pkgconfig.lookup("nanomsg")!), 0o644)!
+
+	binary := filepath.join(testDir, "consumer")
+	cc! consumer, "-o", binary, "@"+flagsFile
+
+	if target.options["shared"][0] == "ON" {
+		os.setenv("LD_LIBRARY_PATH", filepath.join(installDir, "lib"))!
+		os.setenv("DYLD_LIBRARY_PATH", filepath.join(installDir, "lib"))!
+	}
+	exec! binary
+}
