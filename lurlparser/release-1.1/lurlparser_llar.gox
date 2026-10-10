@@ -1,0 +1,109 @@
+import (
+	"os"
+	"path/filepath"
+)
+
+const consumerSource = `#include <iostream>
+
+#include "LUrlParser.h"
+
+int main() {
+    const auto URL = LUrlParser::ParseURL::parseURL("https://John:Dow@github.com:80/corporateshark/LUrlParser");
+
+    if (!URL.isValid()) {
+        return 1;
+    }
+
+    std::cout << "Scheme    : " << URL.scheme_ << std::endl;
+    std::cout << "Host      : " << URL.host_ << std::endl;
+    std::cout << "Port      : " << URL.port_ << std::endl;
+    std::cout << "Path      : " << URL.path_ << std::endl;
+    std::cout << "Query     : " << URL.query_ << std::endl;
+    std::cout << "Fragment  : " << URL.fragment_ << std::endl;
+    std::cout << "User name : " << URL.userName_ << std::endl;
+    std::cout << "Password  : " << URL.password_ << std::endl;
+    return 0;
+}
+`
+
+id "corporateshark/LUrlParser"
+
+fromVer "release-1.1"
+
+onBuild ctx => {
+	installDir := ctx.outputDir
+	projectDir := filepath.join(ctx.SourceDir, "_llar_project")
+	os.mkdirAll(projectDir, 0755)!
+
+	// The release-1.1 source CMakeLists only builds its example. Conan's
+	// exported recipe CMakeLists is the verified library/install entrypoint.
+	cmakeLists := `cmake_minimum_required(VERSION 3.8)
+project(LUrlParser LANGUAGES CXX)
+
+add_library(lurlparser ../LUrlParser.cpp)
+target_include_directories(lurlparser PRIVATE ../)
+target_compile_features(lurlparser PRIVATE cxx_std_11)
+set_target_properties(lurlparser PROPERTIES
+    PUBLIC_HEADER ../LUrlParser.h
+    CMAKE_CXX_STANDARD_REQUIRED ON
+    CMAKE_CXX_EXTENSIONS OFF
+    WINDOWS_EXPORT_ALL_SYMBOLS ON
+)
+
+include(GNUInstallDirs)
+install(
+    TARGETS lurlparser
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+`
+	os.writeFile(filepath.join(projectDir, "CMakeLists.txt"), []byte(cmakeLists), 0644)!
+
+	c := cmake.new(projectDir, filepath.join(ctx.SourceDir, "_build"), installDir)
+	c.define "CMAKE_INSTALL_LIBDIR", "lib"
+	c.defineBool "BUILD_SHARED_LIBS", false
+	c.defineBool "CMAKE_POSITION_INDEPENDENT_CODE", true
+	c.configure
+	c.build
+	c.install
+
+	license := os.readFile(filepath.join(ctx.SourceDir, "License.txt"))!
+	licenseDir := filepath.join(installDir, "licenses")
+	os.mkdirAll(licenseDir, 0755)!
+	os.writeFile(filepath.join(licenseDir, "License.txt"), license, 0644)!
+
+	pcDir := filepath.join(installDir, "lib", "pkgconfig")
+	os.mkdirAll(pcDir, 0755)!
+	pc := pkgconfig.new(
+		name = "lurlparser",
+		description = "Lightweight URL & URI parser",
+		version = "release-1.1",
+		libs = ["-L$${libdir}", "-llurlparser"],
+		cflags = ["-I$${includedir}"],
+	)!
+	out := os.create(filepath.join(pcDir, "lurlparser.pc"))!
+	pc.writeTo(out)!
+	out.close()!
+
+	pkgconfig.use installDir
+	ctx.setMetadata pkgconfig.lookup("lurlparser")!
+}
+
+onTest ctx => {
+	installDir := ctx.outputDir
+	testDir := filepath.join(ctx.SourceDir, "_llar_consumer")
+	os.mkdirAll(testDir, 0755)!
+
+	sourcePath := filepath.join(testDir, "consumer.cpp")
+	os.writeFile(sourcePath, []byte(consumerSource), 0644)!
+
+	pkgconfig.use installDir
+	flagsFile := filepath.join(testDir, "lurlparser.flags")
+	os.writeFile(flagsFile, []byte(pkgconfig.lookup("lurlparser")!), 0644)!
+
+	binary := filepath.join(testDir, "consumer")
+	exec! "c++", "-std=c++11", sourcePath, "-o", binary, "@"+flagsFile
+	exec! binary
+}
