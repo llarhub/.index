@@ -1,0 +1,162 @@
+import (
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+)
+
+const consumerSource = `#include <libdxfrw/libdxfrw.h>
+
+class Dummy : public DRW_Interface {
+public:
+    void addHeader(const DRW_Header*) override {}
+    void addLType(const DRW_LType&) override {}
+    void addLayer(const DRW_Layer&) override {}
+    void addDimStyle(const DRW_Dimstyle&) override {}
+    void addVport(const DRW_Vport&) override {}
+    void addTextStyle(const DRW_Textstyle&) override {}
+    void addAppId(const DRW_AppId&) override {}
+    void addBlock(const DRW_Block&) override {}
+    void setBlock(const int) override {}
+    void endBlock() override {}
+    void addPoint(const DRW_Point&) override {}
+    void addLine(const DRW_Line&) override {}
+    void addRay(const DRW_Ray&) override {}
+    void addXline(const DRW_Xline&) override {}
+    void addArc(const DRW_Arc&) override {}
+    void addCircle(const DRW_Circle&) override {}
+    void addEllipse(const DRW_Ellipse&) override {}
+    void addLWPolyline(const DRW_LWPolyline&) override {}
+    void addPolyline(const DRW_Polyline&) override {}
+    void addSpline(const DRW_Spline*) override {}
+    void addKnot(const DRW_Entity&) override {}
+    void addInsert(const DRW_Insert&) override {}
+    void addTrace(const DRW_Trace&) override {}
+    void add3dFace(const DRW_3Dface&) override {}
+    void addSolid(const DRW_Solid&) override {}
+    void addMText(const DRW_MText&) override {}
+    void addText(const DRW_Text&) override {}
+    void addDimAlign(const DRW_DimAligned*) override {}
+    void addDimLinear(const DRW_DimLinear*) override {}
+    void addDimRadial(const DRW_DimRadial*) override {}
+    void addDimDiametric(const DRW_DimDiametric*) override {}
+    void addDimAngular(const DRW_DimAngular*) override {}
+    void addDimAngular3P(const DRW_DimAngular3p*) override {}
+    void addDimOrdinate(const DRW_DimOrdinate*) override {}
+    void addLeader(const DRW_Leader*) override {}
+    void addHatch(const DRW_Hatch*) override {}
+    void addViewport(const DRW_Viewport&) override {}
+    void addImage(const DRW_Image*) override {}
+    void linkImage(const DRW_ImageDef*) override {}
+    void addComment(const char*) override {}
+    void addPlotSettings(const DRW_PlotSettings*) override {}
+    void writeHeader(DRW_Header&) override {}
+    void writeBlocks() override {}
+    void writeBlockRecords() override {}
+    void writeEntities() override {}
+    void writeLTypes() override {}
+    void writeLayers() override {}
+    void writeTextstyles() override {}
+    void writeVports() override {}
+    void writeDimstyles() override {}
+    void writeObjects() override {}
+    void writeAppId() override {}
+};
+
+int main() {
+    dxfRW writer("consumer.dxf");
+    Dummy iface;
+    return writer.write(&iface, DRW::AC1021, false) ? 0 : 1;
+}
+`
+
+id "LibreCAD/libdxfrw"
+
+fromVer "LC2.2.0"
+
+defaults {
+	"shared": "OFF",
+	"fPIC": "ON",
+}
+
+filter => {
+	for name, values in target.options {
+		if name != "shared" && name != "fPIC" {
+			return false
+		}
+		for value in values {
+			if value != "ON" && value != "OFF" {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+onBuild ctx => {
+	installDir := ctx.outputDir
+	shared := target.options["shared"][0] == "ON"
+	fPIC := target.options["fPIC"][0] == "ON"
+
+	cmakeLists := filepath.join(ctx.SourceDir, "CMakeLists.txt")
+	source := string(os.readFile(cmakeLists)!)
+	source = strings.replace(source, "-Werror", "", 1)
+	os.writeFile(cmakeLists, []byte(source), 0o644)!
+
+	c := cmake.new(ctx.SourceDir, filepath.join(ctx.SourceDir, "_build"), installDir)
+	c.define "CMAKE_INSTALL_LIBDIR", "lib"
+	c.define "CMAKE_POLICY_VERSION_MINIMUM", "3.5"
+	c.defineBool "BUILD_SHARED_LIBS", shared
+	c.defineBool "CMAKE_POSITION_INDEPENDENT_CODE", fPIC
+	c.defineBool "LIBDXFRW_BUILD_DOC", false
+	c.configure
+	c.build
+	c.install
+
+	licenseDir := filepath.join(installDir, "licenses")
+	os.mkdirAll(licenseDir, 0o755)!
+	os.writeFile(filepath.join(licenseDir, "COPYING"), os.readFile(filepath.join(ctx.SourceDir, "COPYING"))!, 0o644)!
+
+	libs := ["-L$${libdir}", "-ldxfrw"]
+	if slices.contains(target.require["os"], "linux") {
+		libs <- "-lm"
+	}
+
+	pcDir := filepath.join(installDir, "lib", "pkgconfig")
+	os.mkdirAll(pcDir, 0o755)!
+	pc := pkgconfig.new(
+		name = "libdxfrw",
+		description = "DXF read/write library",
+		version = "LC2.2.0",
+		libs = libs,
+		cflags = ["-I$${includedir}", "-I$${includedir}/libdxfrw"],
+	)!
+	out := os.create(filepath.join(pcDir, "libdxfrw.pc"))!
+	pc.writeTo(out)!
+	out.close()!
+
+	pkgconfig.use installDir
+	ctx.setMetadata pkgconfig.lookup("libdxfrw")!
+}
+
+onTest ctx => {
+	installDir := ctx.outputDir
+	testDir := filepath.join(ctx.SourceDir, "_llar_consumer")
+	os.mkdirAll(testDir, 0o755)!
+
+	consumer := filepath.join(testDir, "consumer.cpp")
+	os.writeFile(consumer, []byte(consumerSource), 0o644)!
+
+	pkgconfig.use installDir
+	flagsFile := filepath.join(testDir, "libdxfrw.flags")
+	os.writeFile(flagsFile, []byte(pkgconfig.lookup("libdxfrw")!), 0o644)!
+
+	binary := filepath.join(testDir, "consumer")
+	exec! "c++", "-std=c++11", consumer, "-o", binary, "@"+flagsFile
+
+	if target.options["shared"][0] == "ON" {
+		os.setenv("LD_LIBRARY_PATH", filepath.join(installDir, "lib"))!
+		os.setenv("DYLD_LIBRARY_PATH", filepath.join(installDir, "lib"))!
+	}
+	exec! binary
+}
