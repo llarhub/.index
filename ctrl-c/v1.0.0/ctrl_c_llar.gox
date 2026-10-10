@@ -1,0 +1,97 @@
+import (
+	"os"
+	"path/filepath"
+)
+
+const consumerSource = `#include "ctrl-c.h"
+
+int main(void) {
+    unsigned int id = CtrlCLibrary::SetCtrlCHandler([](CtrlCLibrary::CtrlSignal signal){ return true;});
+    CtrlCLibrary::ResetCtrlCHandler(id);
+
+    return 0;
+}
+`
+
+id "evgenykislov/ctrl-c"
+
+fromVer "v1.0.0"
+
+defaults {
+	"shared": "OFF",
+	"fPIC": "ON",
+}
+
+filter => {
+	for name, values in target.options {
+		if name != "shared" && name != "fPIC" {
+			return false
+		}
+		for value in values {
+			if value != "ON" && value != "OFF" {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+onBuild ctx => {
+	installDir := ctx.outputDir
+
+	cmakeLists := ctx.Proj.readFile("v1.0.0/CMakeLists.txt")!
+	os.writeFile(filepath.join(ctx.SourceDir, "CMakeLists.txt"), cmakeLists, 0o644)!
+
+	shared := target.options["shared"][0] == "ON"
+	fPIC := target.options["fPIC"][0] == "ON"
+	c := cmake.new(ctx.SourceDir, filepath.join(ctx.SourceDir, "_build"), installDir)
+	c.define "CTRL_C_SRC_DIR", ctx.SourceDir
+	c.define "CMAKE_INSTALL_LIBDIR", "lib"
+	c.defineBool "BUILD_SHARED_LIBS", shared
+	c.defineBool "CMAKE_POSITION_INDEPENDENT_CODE", fPIC
+	c.configure
+	c.build
+	c.install
+
+	licenseDir := filepath.join(installDir, "licenses")
+	os.mkdirAll(licenseDir, 0o755)!
+	os.writeFile(filepath.join(licenseDir, "LICENSE"), os.readFile(filepath.join(ctx.SourceDir, "LICENSE"))!, 0o644)!
+
+	pcDir := filepath.join(installDir, "lib", "pkgconfig")
+	os.mkdirAll(pcDir, 0o755)!
+	pc := pkgconfig.new(
+		name = "ctrl-c",
+		description = "Crossplatform code to handle Ctrl-C signal",
+		version = "v1.0.0",
+		libs = ["-L$${libdir}", "-lctrl-c"],
+		cflags = ["-I$${includedir}"],
+	)!
+	out := os.create(filepath.join(pcDir, "ctrl-c.pc"))!
+	pc.writeTo(out)!
+	out.close()!
+
+	pkgconfig.use installDir
+	ctx.setMetadata pkgconfig.lookup("ctrl-c")!
+}
+
+onTest ctx => {
+	installDir := ctx.outputDir
+	testDir := filepath.join(ctx.SourceDir, "_llar_consumer")
+	os.mkdirAll(testDir, 0o755)!
+
+	sourcePath := filepath.join(testDir, "consumer.cpp")
+	os.writeFile(sourcePath, []byte(consumerSource), 0o644)!
+
+	pkgconfig.use installDir
+	flagsFile := filepath.join(testDir, "ctrl-c.flags")
+	os.writeFile(flagsFile, []byte(pkgconfig.lookup("ctrl-c")!), 0o644)!
+
+	binary := filepath.join(testDir, "consumer")
+	exec! "c++", "-std=c++11", sourcePath, "-o", binary, "@"+flagsFile
+
+	if target.options["shared"][0] == "ON" {
+		os.setenv("LD_LIBRARY_PATH", filepath.join(installDir, "lib"))!
+		os.setenv("DYLD_LIBRARY_PATH", filepath.join(installDir, "lib"))!
+	}
+	exec! binary
+}
