@@ -1,0 +1,103 @@
+import (
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+const consumerSource = `#include <rawmidi.h>
+
+int main(void) {
+    rawmidi_hw_print_info("/dev/midi");
+    return 0;
+}
+`
+
+// Conan Center cci.20130325 pins krgn/tinymidi to this untagged commit.
+id "krgn/tinymidi"
+
+fromVer "3162cf8faff04e26a8daa846618b90326f71b9d5"
+
+defaults {
+	"shared": "OFF",
+	"fPIC": "ON",
+}
+
+filter => {
+	for name, values in target.options {
+		if name != "shared" && name != "fPIC" {
+			return false
+		}
+		for value in values {
+			if value != "ON" && value != "OFF" {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+onBuild ctx => {
+	installDir := ctx.outputDir
+
+	cmakeLists := ctx.Proj.readFile("3162cf8faff04e26a8daa846618b90326f71b9d5/CMakeLists.txt")!
+	os.writeFile(filepath.join(ctx.SourceDir, "CMakeLists.txt"), cmakeLists, 0o644)!
+
+	if target.require["os"][0] == "darwin" {
+		headerPath := filepath.join(ctx.SourceDir, "include", "rawmidi.h")
+		header := string(os.readFile(headerPath)!)
+		header = strings.replace(header, "#include <endian.h>", "#include <machine/endian.h>", 1)
+		os.writeFile(headerPath, []byte(header), 0o644)!
+	}
+
+	shared := target.options["shared"][0] == "ON"
+	fPIC := target.options["fPIC"][0] == "ON"
+	c := cmake.new(ctx.SourceDir, filepath.join(ctx.SourceDir, "_build"), installDir)
+	c.define "TINYMIDI_SRC_DIR", ctx.SourceDir
+	c.define "CMAKE_INSTALL_LIBDIR", "lib"
+	c.defineBool "BUILD_SHARED_LIBS", shared
+	c.defineBool "CMAKE_POSITION_INDEPENDENT_CODE", fPIC
+	c.configure
+	c.build
+	c.install
+
+	licenseDir := filepath.join(installDir, "licenses")
+	os.mkdirAll(licenseDir, 0o755)!
+	os.writeFile(filepath.join(licenseDir, "COPYING"), os.readFile(filepath.join(ctx.SourceDir, "COPYING"))!, 0o644)!
+
+	pcDir := filepath.join(installDir, "lib", "pkgconfig")
+	os.mkdirAll(pcDir, 0o755)!
+	pc := pkgconfig.new(
+		name = "tinymidi",
+		description = "A small C library for doing MIDI on GNU/Linux",
+		version = "3162cf8faff04e26a8daa846618b90326f71b9d5",
+		libs = ["-L$${libdir}", "-ltinymidi"],
+		cflags = ["-I$${includedir}"],
+	)!
+	out := os.create(filepath.join(pcDir, "tinymidi.pc"))!
+	pc.writeTo(out)!
+	out.close()!
+
+	pkgconfig.use installDir
+	ctx.setMetadata pkgconfig.lookup("tinymidi")!
+}
+
+onTest ctx => {
+	installDir := ctx.outputDir
+	testDir := filepath.join(ctx.SourceDir, "_llar_consumer")
+	os.mkdirAll(testDir, 0o755)!
+
+	consumer := filepath.join(testDir, "consumer.c")
+	os.writeFile(consumer, []byte(consumerSource), 0o644)!
+
+	pkgconfig.use installDir
+	flags := pkgconfig.lookup("tinymidi")!
+	flagsFile := filepath.join(testDir, "tinymidi.flags")
+	os.writeFile(flagsFile, []byte(flags), 0o644)!
+
+	binary := filepath.join(testDir, "consumer")
+	cc! consumer, "@"+flagsFile, "-o", binary
+
+	os.setenv("LD_LIBRARY_PATH", filepath.join(installDir, "lib"))!
+	os.setenv("DYLD_LIBRARY_PATH", filepath.join(installDir, "lib"))!
+	exec! binary
+}
