@@ -1,0 +1,122 @@
+import (
+	"os"
+	"path/filepath"
+	"slices"
+)
+
+const consumerSource = `#include <gflags/gflags.h>
+
+DEFINE_bool(llar_probe, false, "consumer probe flag");
+
+int main(int argc, char** argv) {
+    gflags::ParseCommandLineFlags(&argc, &argv, true);
+    return 0;
+}
+`
+
+id "gflags/gflags"
+
+fromVer "v2.3.1"
+
+defaults {
+	"shared": "OFF",
+	"fPIC": "ON",
+	"nothreads": "ON",
+}
+
+filter => {
+	for name, values in target.options {
+		if name != "shared" && name != "fPIC" && name != "nothreads" {
+			return false
+		}
+		for value in values {
+			if value != "ON" && value != "OFF" {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+onBuild ctx => {
+	installDir := ctx.outputDir
+	shared := target.options["shared"][0] == "ON"
+	fPIC := target.options["fPIC"][0] == "ON"
+	nothreads := target.options["nothreads"][0] == "ON"
+
+	c := cmake.new(ctx.SourceDir, filepath.join(ctx.SourceDir, "_build"), installDir)
+	c.define "CMAKE_INSTALL_LIBDIR", "lib"
+	c.define "CMAKE_POLICY_VERSION_MINIMUM", "3.5"
+	c.defineBool "BUILD_SHARED_LIBS", shared
+	c.defineBool "BUILD_STATIC_LIBS", !shared
+	c.defineBool "BUILD_gflags_LIB", !nothreads
+	c.defineBool "BUILD_gflags_nothreads_LIB", nothreads
+	c.defineBool "BUILD_PACKAGING", false
+	c.defineBool "BUILD_TESTING", false
+	c.defineBool "INSTALL_HEADERS", true
+	c.defineBool "INSTALL_SHARED_LIBS", shared
+	c.defineBool "INSTALL_STATIC_LIBS", !shared
+	c.defineBool "REGISTER_BUILD_DIR", false
+	c.defineBool "REGISTER_INSTALL_PREFIX", false
+	c.defineBool "CMAKE_POSITION_INDEPENDENT_CODE", fPIC
+	c.define "GFLAGS_NAMESPACE", "gflags"
+	c.configure
+	c.build
+	c.install
+
+	licenseDir := filepath.join(installDir, "licenses")
+	os.mkdirAll(licenseDir, 0o755)!
+	os.writeFile(filepath.join(licenseDir, "COPYING.txt"), os.readFile(filepath.join(ctx.SourceDir, "COPYING.txt"))!, 0o644)!
+
+	libName := "gflags"
+	if nothreads {
+		libName = "gflags_nothreads"
+	}
+
+	libs := ["-L$${libdir}", "-l"+libName]
+	if slices.contains(target.require["os"], "linux") {
+		libs <- "-lm"
+		if !nothreads {
+			libs <- "-lpthread"
+		}
+	}
+
+	pcDir := filepath.join(installDir, "lib", "pkgconfig")
+	os.mkdirAll(pcDir, 0o755)!
+	pc := pkgconfig.new(
+		name = "gflags",
+		description = "A commandline flags library that allows for distributed flags.",
+		version = "v2.3.1",
+		URL = "http://gflags.github.io/gflags",
+		libs = libs,
+		cflags = ["-I$${includedir}"],
+	)!
+	out := os.create(filepath.join(pcDir, "gflags.pc"))!
+	pc.writeTo(out)!
+	out.close()!
+
+	pkgconfig.use installDir
+	ctx.setMetadata pkgconfig.lookup("gflags")!
+}
+
+onTest ctx => {
+	installDir := ctx.outputDir
+	testDir := filepath.join(ctx.SourceDir, "_llar_consumer")
+	os.mkdirAll(testDir, 0o755)!
+
+	consumer := filepath.join(testDir, "consumer.cpp")
+	os.writeFile(consumer, []byte(consumerSource), 0o644)!
+
+	pkgconfig.use installDir
+	flagsFile := filepath.join(testDir, "gflags.flags")
+	os.writeFile(flagsFile, []byte(pkgconfig.lookup("gflags")!), 0o644)!
+
+	binary := filepath.join(testDir, "consumer")
+	exec! "c++", "-std=c++11", consumer, "-o", binary, "@"+flagsFile
+
+	if target.options["shared"][0] == "ON" {
+		os.setenv("LD_LIBRARY_PATH", filepath.join(installDir, "lib"))!
+		os.setenv("DYLD_LIBRARY_PATH", filepath.join(installDir, "lib"))!
+	}
+	exec! binary
+}
