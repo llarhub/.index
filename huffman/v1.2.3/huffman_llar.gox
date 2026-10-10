@@ -1,0 +1,123 @@
+import (
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+const consumerSource = `#include <stdint.h>
+#include <stdlib.h>
+
+#include "huffman/huffman.h"
+
+int main(void) {
+    uint8_t input[3] = {'a', 'b', 'c'};
+    unsigned char *encoded = NULL;
+    uint32_t encoded_len = 0;
+
+    if (huffman_encode_memory(input, 3, &encoded, &encoded_len) != 0) {
+        return 1;
+    }
+
+    free(encoded);
+    return encoded_len == 0;
+}
+`
+
+id "drichardson/huffman"
+
+// v1.2.3 is the first upstream tag with the CMake build and install contract
+// used by v1.2.3 through v1.2.7.
+fromVer "v1.2.3"
+
+defaults {
+	"shared": "OFF",
+	"fPIC": "ON",
+}
+
+filter => {
+	for name, values in target.options {
+		if name != "shared" && name != "fPIC" {
+			return false
+		}
+		for value in values {
+			if value != "ON" && value != "OFF" {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+onBuild ctx => {
+	installDir := ctx.outputDir
+
+	// Match the Conan recipe's Cygwin source fix while retaining upstream
+	// behavior on native Windows and other platforms.
+	sourcePath := filepath.join(ctx.SourceDir, "huffman.c")
+	source := string(os.readFile(sourcePath)!)
+	source = strings.replace(source, "#ifdef WIN32", "#if defined _WIN32 || defined __CYGWIN__", 1)
+	os.writeFile(sourcePath, []byte(source), 0o644)!
+
+	shared := target.options["shared"][0] == "ON"
+	fPIC := target.options["fPIC"][0] == "ON"
+
+	c := cmake.new(ctx.SourceDir, filepath.join(ctx.SourceDir, "_build"), installDir)
+	c.define "CMAKE_POLICY_VERSION_MINIMUM", "3.5"
+	c.define "CMAKE_INSTALL_LIBDIR", "lib"
+	c.defineBool "BUILD_SHARED_LIBS", shared
+	c.defineBool "CMAKE_POSITION_INDEPENDENT_CODE", fPIC
+	c.configure
+	c.build
+	c.install
+
+	licenseDir := filepath.join(installDir, "licenses")
+	os.mkdirAll(licenseDir, 0o755)!
+	os.writeFile(filepath.join(licenseDir, "LICENSE"), os.readFile(filepath.join(ctx.SourceDir, "LICENSE"))!, 0o644)!
+
+	libs := ["-L$${libdir}", "-lhuffman"]
+	if target.require["os"][0] == "windows" {
+		libs <- "-lws2_32"
+	}
+
+	pcDir := filepath.join(installDir, "lib", "pkgconfig")
+	os.mkdirAll(pcDir, 0o755)!
+	pc := pkgconfig.new(
+		name = "huffman",
+		description = "Huffman encoder and decoder library",
+		version = "v1.2.3",
+		libs = libs,
+		cflags = ["-I$${includedir}"],
+	)!
+	out := os.create(filepath.join(pcDir, "huffman.pc"))!
+	pc.writeTo(out)!
+	out.close()!
+
+	pkgconfig.use installDir
+	ctx.setMetadata pkgconfig.lookup("huffman")!
+}
+
+onTest ctx => {
+	installDir := ctx.outputDir
+	testDir := filepath.join(ctx.SourceDir, "_llar_consumer")
+	os.mkdirAll(testDir, 0o755)!
+
+	sourcePath := filepath.join(testDir, "consumer.c")
+	os.writeFile(sourcePath, []byte(consumerSource), 0o644)!
+
+	pkgconfig.use installDir
+	flagsFile := filepath.join(testDir, "huffman.flags")
+	os.writeFile(flagsFile, []byte(pkgconfig.lookup("huffman")!), 0o644)!
+
+	binary := filepath.join(testDir, "consumer")
+	cc! sourcePath, "-o", binary, "@"+flagsFile
+
+	if target.options["shared"][0] == "ON" {
+		os.setenv("LD_LIBRARY_PATH", filepath.join(installDir, "lib"))!
+		os.setenv("DYLD_LIBRARY_PATH", filepath.join(installDir, "lib"))!
+		if target.require["os"][0] == "windows" {
+			path := os.getenv("PATH")
+			os.setenv("PATH", filepath.join(installDir, "bin")+";"+path)!
+		}
+	}
+	exec! binary
+}
